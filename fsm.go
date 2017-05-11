@@ -34,10 +34,18 @@ type transitioner interface {
 	transition(*FSM) error
 }
 
+// transitionerStruct is the default implementation of the transitioner
+// interface. Other implementations can be swapped in for testing.
+type transitionerStruct struct {
+}
+
 // FSM is the state machine that holds the current state.
 //
 // It has to be created with NewFSM to function properly.
 type FSM struct {
+	// mutex is used for synchronization to achieve thread safety
+	mutex sync.RWMutex
+
 	// current is the state that the FSM is currently in.
 	current string
 
@@ -50,13 +58,9 @@ type FSM struct {
 	// transition is the internal transition functions used either directly
 	// or when Transition is called in an asynchronous state transition.
 	transition func()
+
 	// transitionerObj calls the FSM's transition() function.
 	transitionerObj transitioner
-
-	// stateMu guards access to the current state.
-	stateMu sync.RWMutex
-	// eventMu guards access to Event() and Transition().
-	eventMu sync.Mutex
 }
 
 // EventDesc represents an event when initializing the FSM.
@@ -144,7 +148,7 @@ func NewFSM(initial string, events []EventDesc, callbacks map[string]Callback) *
 	}
 
 	// Map all callbacks to events/states.
-	for name, fn := range callbacks {
+	for name, c := range callbacks {
 		var target string
 		var callbackType int
 
@@ -191,7 +195,14 @@ func NewFSM(initial string, events []EventDesc, callbacks map[string]Callback) *
 		}
 
 		if callbackType != callbackNone {
-			f.callbacks[cKey{target, callbackType}] = fn
+			cl := c
+			f.callbacks[cKey{target, callbackType}] = func(e *Event) {
+				// This always happens in a locked condition, but needs to be unlocked
+				// to not risk a deadlock. The reversed order is not a mistake!
+				f.mutex.Unlock()
+				defer f.mutex.Lock()
+				cl(e)
+			}
 		}
 	}
 
@@ -200,22 +211,22 @@ func NewFSM(initial string, events []EventDesc, callbacks map[string]Callback) *
 
 // Current returns the current state of the FSM.
 func (f *FSM) Current() string {
-	f.stateMu.RLock()
-	defer f.stateMu.RUnlock()
+	f.mutex.RLock()
+	defer f.mutex.RUnlock()
 	return f.current
 }
 
 // Is returns true if state is the current state.
 func (f *FSM) Is(state string) bool {
-	f.stateMu.RLock()
-	defer f.stateMu.RUnlock()
+	f.mutex.RLock()
+	defer f.mutex.RUnlock()
 	return state == f.current
 }
 
 // Can returns true if event can occur in the current state.
 func (f *FSM) Can(event string) bool {
-	f.stateMu.RLock()
-	defer f.stateMu.RUnlock()
+	f.mutex.RLock()
+	defer f.mutex.RUnlock()
 	_, ok := f.transitions[eKey{event, f.current}]
 	return ok && (f.transition == nil)
 }
@@ -244,24 +255,21 @@ func (f *FSM) Cannot(event string) bool {
 // The last error should never occur in this situation and is a sign of an
 // internal bug.
 func (f *FSM) Event(event string, args ...interface{}) error {
-	f.eventMu.Lock()
-	defer f.eventMu.Unlock()
-
-	f.stateMu.RLock()
-	defer f.stateMu.RUnlock()
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
 
 	if f.transition != nil {
-		return InTransitionError{event}
+		return &InTransitionError{event}
 	}
 
 	dst, ok := f.transitions[eKey{event, f.current}]
 	if !ok {
 		for ekey := range f.transitions {
 			if ekey.event == event {
-				return InvalidEventError{event, f.current}
+				return &InvalidEventError{event, f.current}
 			}
 		}
-		return UnknownEventError{event}
+		return &UnknownEventError{event}
 	}
 
 	e := &Event{f, event, f.current, dst, nil, args, false, false}
@@ -273,32 +281,25 @@ func (f *FSM) Event(event string, args ...interface{}) error {
 
 	if f.current == dst {
 		f.afterEventCallbacks(e)
-		return NoTransitionError{e.Err}
+		// return &NoTransitionError{e.Err}
 	}
 
 	// Setup the transition, call it later.
 	f.transition = func() {
-		f.stateMu.Lock()
 		f.current = dst
-		f.stateMu.Unlock()
-
 		f.enterStateCallbacks(e)
 		f.afterEventCallbacks(e)
 	}
 
-	if err = f.leaveStateCallbacks(e); err != nil {
-		if _, ok := err.(CanceledError); ok {
-			f.transition = nil
-		}
+	err = f.leaveStateCallbacks(e)
+	if err != nil {
 		return err
 	}
 
 	// Perform the rest of the transition, if not asynchronous.
-	f.stateMu.RUnlock()
 	err = f.doTransition()
-	f.stateMu.RLock()
 	if err != nil {
-		return InternalError{}
+		return &InternalError{}
 	}
 
 	return e.Err
@@ -306,8 +307,8 @@ func (f *FSM) Event(event string, args ...interface{}) error {
 
 // Transition wraps transitioner.transition.
 func (f *FSM) Transition() error {
-	f.eventMu.Lock()
-	defer f.eventMu.Unlock()
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
 	return f.doTransition()
 }
 
@@ -316,17 +317,13 @@ func (f *FSM) doTransition() error {
 	return f.transitionerObj.transition(f)
 }
 
-// transitionerStruct is the default implementation of the transitioner
-// interface. Other implementations can be swapped in for testing.
-type transitionerStruct struct{}
-
 // Transition completes an asynchrounous state change.
 //
 // The callback for leave_<STATE> must prviously have called Async on its
 // event to have initiated an asynchronous state transition.
 func (t transitionerStruct) transition(f *FSM) error {
 	if f.transition == nil {
-		return NotInTransitionError{}
+		return &NotInTransitionError{}
 	}
 	f.transition()
 	f.transition = nil
@@ -339,13 +336,13 @@ func (f *FSM) beforeEventCallbacks(e *Event) error {
 	if fn, ok := f.callbacks[cKey{e.Event, callbackBeforeEvent}]; ok {
 		fn(e)
 		if e.canceled {
-			return CanceledError{e.Err}
+			return &CanceledError{e.Err}
 		}
 	}
 	if fn, ok := f.callbacks[cKey{"", callbackBeforeEvent}]; ok {
 		fn(e)
 		if e.canceled {
-			return CanceledError{e.Err}
+			return &CanceledError{e.Err}
 		}
 	}
 	return nil
@@ -357,17 +354,19 @@ func (f *FSM) leaveStateCallbacks(e *Event) error {
 	if fn, ok := f.callbacks[cKey{f.current, callbackLeaveState}]; ok {
 		fn(e)
 		if e.canceled {
-			return CanceledError{e.Err}
+			f.transition = nil
+			return &CanceledError{e.Err}
 		} else if e.async {
-			return AsyncError{e.Err}
+			return &AsyncError{e.Err}
 		}
 	}
 	if fn, ok := f.callbacks[cKey{"", callbackLeaveState}]; ok {
 		fn(e)
 		if e.canceled {
-			return CanceledError{e.Err}
+			f.transition = nil
+			return &CanceledError{e.Err}
 		} else if e.async {
-			return AsyncError{e.Err}
+			return &AsyncError{e.Err}
 		}
 	}
 	return nil
